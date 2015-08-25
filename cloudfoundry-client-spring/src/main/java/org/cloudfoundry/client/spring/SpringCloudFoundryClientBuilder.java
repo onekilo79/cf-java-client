@@ -26,6 +26,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.converter.json.MappingJackson2HttpMessageConverter;
 import org.springframework.security.oauth2.client.DefaultOAuth2ClientContext;
 import org.springframework.security.oauth2.client.OAuth2ClientContext;
+import org.springframework.security.oauth2.client.OAuth2RestOperations;
 import org.springframework.security.oauth2.client.OAuth2RestTemplate;
 import org.springframework.security.oauth2.client.resource.OAuth2ProtectedResourceDetails;
 import org.springframework.security.oauth2.client.token.DefaultAccessTokenRequest;
@@ -165,11 +166,11 @@ public final class SpringCloudFoundryClientBuilder {
                 .build();
     }
 
-    private RestTemplate getRestOperations() {
+    private OAuth2RestOperations getRestOperations() {
         OAuth2ProtectedResourceDetails oAuth2ProtectedResourceDetails = getOAuth2ProtectedResourceDetails();
         OAuth2ClientContext oAuth2ClientContext = getOAuth2ClientContext();
 
-        RestTemplate restTemplate = new OAuth2RestTemplate(oAuth2ProtectedResourceDetails, oAuth2ClientContext);
+        OAuth2RestTemplate restTemplate = new OAuth2RestTemplate(oAuth2ProtectedResourceDetails, oAuth2ClientContext);
         restTemplate.getMessageConverters().stream()
                 .filter(converter -> converter instanceof MappingJackson2HttpMessageConverter)
                 .map(converter -> (MappingJackson2HttpMessageConverter) converter)

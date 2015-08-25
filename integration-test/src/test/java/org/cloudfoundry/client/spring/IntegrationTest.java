@@ -17,6 +17,9 @@
 package org.cloudfoundry.client.spring;
 
 import org.cloudfoundry.client.CloudFoundryClient;
+import org.cloudfoundry.client.LoggregatorClient;
+import org.cloudfoundry.client.loggregator.StreamLogsRequest;
+import org.cloudfoundry.client.loggregator.StreamLogsResponse;
 import org.cloudfoundry.client.v2.Resource;
 import org.cloudfoundry.client.v2.spaces.ListSpacesRequest;
 import org.cloudfoundry.client.v2.spaces.ListSpacesResponse;
@@ -27,11 +30,9 @@ import org.cloudfoundry.client.v3.applications.DeleteApplicationResponse;
 import org.cloudfoundry.client.v3.applications.ListApplicationsRequest;
 import org.cloudfoundry.client.v3.applications.ListApplicationsResponse;
 import org.cloudfoundry.client.v3.droplets.GetDropletRequest;
-import org.cloudfoundry.client.v3.droplets.GetDropletResponse;
 import org.cloudfoundry.client.v3.packages.CreatePackageRequest;
 import org.cloudfoundry.client.v3.packages.CreatePackageResponse;
 import org.cloudfoundry.client.v3.packages.GetPackageRequest;
-import org.cloudfoundry.client.v3.packages.GetPackageResponse;
 import org.cloudfoundry.client.v3.packages.StagePackageRequest;
 import org.cloudfoundry.client.v3.packages.StagePackageResponse;
 import org.cloudfoundry.client.v3.packages.UploadPackageRequest;
@@ -44,10 +45,13 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.bind.RelaxedPropertyResolver;
 import org.springframework.core.env.StandardEnvironment;
 import reactor.Publishers;
+import reactor.rx.Stream;
 import reactor.rx.Streams;
+import reactor.rx.action.Control;
 
 import java.io.File;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.cloudfoundry.client.v3.packages.CreatePackageRequest.PackageType.BITS;
 
 public final class IntegrationTest {
@@ -58,7 +62,9 @@ public final class IntegrationTest {
 
     private volatile File bits;
 
-    private volatile CloudFoundryClient client;
+    private volatile CloudFoundryClient cloudFoundryClient;
+
+    private volatile LoggregatorClient loggregatorClient;
 
     private volatile String space;
 
@@ -70,44 +76,63 @@ public final class IntegrationTest {
         this.bits = resolver.getRequiredProperty("test.bits", File.class);
         this.space = resolver.getRequiredProperty("test.space");
 
-        this.client = new SpringCloudFoundryClientBuilder()
+        this.cloudFoundryClient = new SpringCloudFoundryClientBuilder()
                 .withApi(resolver.getRequiredProperty("test.host"))
                 .withCredentials(
                         resolver.getRequiredProperty("test.username"),
                         resolver.getRequiredProperty("test.password"))
                 .withSkipSslValidation(resolver.getProperty("test.skipSslValidation", Boolean.class, false))
                 .build();
+
+        this.loggregatorClient = new SpringLoggregatorClientBuilder()
+                .withCloudFoundryClient(this.cloudFoundryClient)
+                .build();
     }
 
     @Test
-    public void test() throws InterruptedException {
-        Streams.wrap(listApplications())
-                .flatMap(this::split)
+    public void createApplication() {
+        listApplications()
+                .flatMap(response -> Streams.from(response.getResources()))
                 .flatMap(this::deleteApplication)
-                .consume(response -> {
-                        }, this::handleError,
+                .consume(this::ignoreResponse, this::handleError,
                         r -> this.logger.info("All existing applications deleted"));
 
-        Streams.wrap(listSpaces())
-                .flatMap(this::createApplication)
-                .observe(response -> this.logger.info("Application created"))
+        Stream<CreateApplicationResponse> createApplicationStream = listSpaces()
+                .flatMap(this::createApplication);
+        // TODO: .broadcast();
+
+        Control loggregatorControl = createApplicationStream
+                .flatMap(this::streamLogs)
+                .consume(this::printLog, this::handleError, r -> this.logger.info("Logging finished"));
+
+        createApplicationStream
                 .flatMap(this::createPackage)
-                .observe(response -> this.logger.info("Package created"))
-                .flatMap(this::uploadBits)
-                .observe(response -> this.logger.info("Package uploading"))
-                .flatMap(this::waitForUploadProcessing)
-                .observe(response -> this.logger.info("Package uploaded"))
+                .flatMap(this::uploadPackage)
+                .flatMap(this::waitForPackageUploadProcessing)
                 .flatMap(this::stagePackage)
-                .observe(response -> this.logger.info("Package staging"))
-                .flatMap(this::waitForStaging)
-                .observe(response -> this.logger.info("Package staged"))
-                .keepAlive()
-                .consume(response -> {
-                    this.logger.info(response.getState());
-                }, this::handleError);
+                .flatMap(this::waitForPackageStagingProcessing)
+                .consume(this::ignoreResponse, this::handleError, r -> {
+                    this.logger.info("Integration test finished");
+                    loggregatorControl.cancel();
+                });
+
+        // TODO: createApplicationStream.connect();
     }
 
-    private Publisher<CreateApplicationResponse> createApplication(ListSpacesResponse response) {
+    private void handleError(Throwable exception) {
+        this.logger.error("Error encountered: {}", exception.getMessage());
+        System.exit(1);
+    }
+
+    private void ignoreResponse(Object response) {
+    }
+
+    private void printLog(StreamLogsResponse r) {
+        this.logger.info("[{}/{}] {} {}", r.getSourceName(), r.getSourceId(), r
+                .getMessageType(), r.getMessage());
+    }
+
+    private Stream<CreateApplicationResponse> createApplication(ListSpacesResponse response) {
         Resource.Metadata metadata = response.getResources().stream()
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException("Could not find space " + this.space))
@@ -117,7 +142,9 @@ public final class IntegrationTest {
                 .withSpaceId(metadata.getId())
                 .withName(this.application);
 
-        return this.client.applications().create(request);
+        return Streams.wrap(this.cloudFoundryClient.applications().create(request))
+                .observeSubscribe(s -> this.logger.info("Creating application"))
+                .observe(r -> this.logger.info("Created application"));
     }
 
     private Publisher<CreatePackageResponse> createPackage(CreateApplicationResponse response) {
@@ -125,107 +152,107 @@ public final class IntegrationTest {
                 .withApplicationId(response.getId())
                 .withType(BITS);
 
-        return this.client.packages().create(request);
+        return Streams.wrap(this.cloudFoundryClient.packages().create(request))
+                .observeSubscribe(s -> this.logger.info("Creating package"))
+                .observe(r -> this.logger.info("Created package"));
     }
 
     private Publisher<DeleteApplicationResponse> deleteApplication(ListApplicationsResponse.Resource resource) {
         DeleteApplicationRequest request = new DeleteApplicationRequest()
                 .withId(resource.getId());
 
-        return this.client.applications().delete(request);
+        return Streams.wrap(this.cloudFoundryClient.applications().delete(request))
+                .observeSubscribe(s -> this.logger.info("Deleting application"))
+                .observe(r -> this.logger.info("Deleted application"));
     }
 
-    private void handleError(Throwable exception) {
-        this.logger.error("Error encountered: {}", exception.getMessage());
+    private Stream<ListApplicationsResponse> listApplications() {
+        return Streams.wrap(this.cloudFoundryClient.applications().list(new ListApplicationsRequest()));
     }
 
-    private Publisher<ListApplicationsResponse> listApplications() {
-        return this.client.applications().list(new ListApplicationsRequest());
+    private Stream<ListSpacesResponse> listSpaces() {
+        return Streams.wrap(this.cloudFoundryClient.spaces().list(new ListSpacesRequest().filterByName(this.space)));
     }
 
-    private Publisher<ListSpacesResponse> listSpaces() {
-        ListSpacesRequest request = new ListSpacesRequest()
-                .filterByName(this.space);
-
-        return this.client.spaces().list(request);
-    }
-
-    private Publisher<ListApplicationsResponse.Resource> split(ListApplicationsResponse response) {
-        return Streams.from(response.getResources());
-    }
-
-    private Publisher<StagePackageResponse> stagePackage(GetPackageResponse response) {
+    private Publisher<StagePackageResponse> stagePackage(UploadPackageResponse response) {
         StagePackageRequest request = new StagePackageRequest()
                 .withId(response.getId())
                 .withBuildpack("https://github.com/cloudfoundry/java-buildpack.git");
 
-        return this.client.packages().stage(request);
+        return Streams.wrap(this.cloudFoundryClient.packages().stage(request))
+                .observe(r -> this.logger.info("Staging package"));
     }
 
-    private Publisher<UploadPackageResponse> uploadBits(CreatePackageResponse response) {
+    private Publisher<StreamLogsResponse> streamLogs(CreateApplicationResponse response) {
+        StreamLogsRequest request = new StreamLogsRequest()
+                .withId(response.getId());
+
+        return this.loggregatorClient.stream(request);
+    }
+
+    private Publisher<UploadPackageResponse> uploadPackage(CreatePackageResponse response) {
         UploadPackageRequest request = new UploadPackageRequest()
                 .withId(response.getId())
                 .withFile(this.bits);
 
-        return this.client.packages().upload(request);
+        return Streams.wrap(this.cloudFoundryClient.packages().upload(request))
+                .observeSubscribe(s -> this.logger.info("Uploading package"));
     }
 
-    private Publisher<GetDropletResponse> waitForStaging(StagePackageResponse stagePackageResponse) {
-        return Streams.wrap(Publishers.<GetDropletResponse>create(subscriber -> {
-            for (; ; ) {
-                GetDropletRequest request = new GetDropletRequest()
-                        .withId(stagePackageResponse.getId());
+    private Publisher<StagePackageResponse> waitForPackageStagingProcessing(StagePackageResponse response) {
+        return Streams.wrap(Publishers.<StagePackageResponse>create(subscriber -> {
+            GetDropletRequest request = new GetDropletRequest()
+                    .withId(response.getId());
 
-                Streams.wrap(this.client.droplets().get(request))
-                        .observe(response -> this.logger.debug("Package staging: {}", response.getState()))
-                        .observe(response -> this.logger.info("Waiting for package staging"))
-                        .consume(subscriber::onNext);
-
-                if (subscriber.isCancelled()) {
-                    subscriber.onComplete();
-                    break;
-                }
-
-                try {
-                    Thread.sleep(5000);
-                } catch (InterruptedException e) {
-                    throw new RuntimeException(e);
-                }
-            }
-        })).observe(getPackageResponse -> {
-            if ("FAILED".equals(getPackageResponse.getState())) {
-                throw new IllegalStateException(getPackageResponse.getError());
-            }
-        }).filter(getDropletResponse -> "STAGED".equals(getDropletResponse.getState()));
+            Streams.wrap(this.cloudFoundryClient.droplets().get(request))
+                    .observe(r -> this.logger.debug("Staging package processing: {}", r.getState()))
+                    .consume(r -> {
+                        if ("STAGED".equals(r.getState())) {
+                            subscriber.onNext(response);
+                            subscriber.onComplete();
+                        } else if ("FAILED".equals(r.getState())) {
+                            subscriber.onError(new ProcessingFailed(r.getError()));
+                        } else {
+                            subscriber.onError(new ProcessingIncomplete());
+                        }
+                    }, subscriber::onError);
+        })).retryWhen(errors -> errors.flatMap(throwable -> {
+                    if (throwable instanceof ProcessingIncomplete) {
+                        return Streams.timer(1, SECONDS)
+                                .observeSubscribe(s -> this.logger.info("Waiting for package staging processing"));
+                    } else {
+                        return Publishers.error(throwable);
+                    }
+                })
+        ).observe(r -> this.logger.info("Staged package"));
     }
 
-    private Publisher<GetPackageResponse> waitForUploadProcessing(UploadPackageResponse uploadPackageResponse) {
-        return Streams.wrap(Publishers.<GetPackageResponse>create(subscriber -> {
-            for (; ; ) {
-                GetPackageRequest request = new GetPackageRequest()
-                        .withId(uploadPackageResponse.getId());
+    private Publisher<UploadPackageResponse> waitForPackageUploadProcessing(UploadPackageResponse response) {
+        return Streams.wrap(Publishers.<UploadPackageResponse>create(subscriber -> {
+            GetPackageRequest request = new GetPackageRequest()
+                    .withId(response.getId());
 
-                Streams.wrap(this.client.packages().get(request))
-                        .observe(response -> this.logger.debug("Package upload processing: {}", response.getState()))
-                        .observe(response -> this.logger.info("Waiting for package upload processing"))
-                        .consume(subscriber::onNext);
-
-                if (subscriber.isCancelled()) {
-                    subscriber.onComplete();
-                    break;
-                }
-
-                try {
-                    Thread.sleep(5000);
-                } catch (InterruptedException e) {
-                    throw new RuntimeException(e);
-                }
-            }
-        })).observe(getPackageResponse -> {
-            if ("FAILED".equals(getPackageResponse.getState())) {
-                throw new IllegalStateException(getPackageResponse.getError());
-            }
-        }).filter(getPackageResponse -> "READY".equals(getPackageResponse.getState()));
+            Streams.wrap(this.cloudFoundryClient.packages().get(request))
+                    .observe(r -> this.logger.warn("Upload package processing: {}", r.getState()))
+                    .consume(r -> {
+                        if ("READY".equals(r.getState())) {
+                            subscriber.onNext(response);
+                            subscriber.onComplete();
+                        } else if ("FAILED".equals(r.getState())) {
+                            subscriber.onError(new ProcessingFailed(r.getError()));
+                        } else {
+                            subscriber.onError(new ProcessingIncomplete());
+                        }
+                    }, subscriber::onError);
+        })).retryWhen(errors -> errors.flatMap(throwable -> {
+                    if (throwable instanceof ProcessingIncomplete) {
+                        return Streams.timer(1, SECONDS)
+                                .observeSubscribe(s -> this.logger.info("Waiting for package upload processing"));
+                    } else {
+                        return Publishers.error(throwable);
+                    }
+                })
+        ).observe(r -> this.logger.info("Uploaded package"));
     }
 
 }

@@ -42,6 +42,14 @@ public interface CloudFoundryClient {
     Droplets droplets();
 
     /**
+     * Returns the OAuth2 access token currently being used by the client.  This is typically used by implementations of
+     * {@link LoggregatorClient} to construct {@code Authorization} headers.
+     *
+     * @return the OAuth2 access token currently being used by the client
+     */
+    String getAccessToken();
+
+    /**
      * Main entry point to the Cloud Foundry Info Client API
      *
      * @return the Cloud Foundry Info Client API
